@@ -18,7 +18,7 @@ from sqlalchemy import (
 from sqlalchemy.orm import declarative_base, sessionmaker, Session
 from sklearn.feature_extraction.text import TfidfVectorizer
 from sklearn.metrics.pairwise import cosine_similarity
-from ml_models import predict_flood_risk, predict_rainfall, load_models
+from ml_models import predict_rainfall, load_models
 
 # -------------------------------------------------------------------
 # Configuration
@@ -337,14 +337,6 @@ class AdvisoryRequest(BaseModel):
     soil_moisture: float = 50
     humidity: float = 70
 
-class RiskRequest(BaseModel):
-    rainfall_24h: float = 35
-    rainfall_7d: float = 100
-    predicted_rainfall_24h: float = 0
-    soil_moisture: float = 55
-    river_level: float = 1.0
-    slope: str = "moderate"
-
 class PostRequest(BaseModel):
     author: str = "Demo Farmer"
     title: str
@@ -444,57 +436,6 @@ def advisory_engine(p):
         "alerts": alerts,
         "model": "Rule-Based Expert System",
     }
-
-def flood_risk_engine(p):
-    """ML-first flood risk prediction.
-
-    The Random Forest is trained from historical environmental + flood records.
-    A small rule-based fallback is retained only for development when the model
-    has not yet been trained.
-    """
-    try:
-        predicted = p.predicted_rainfall_24h or p.rainfall_24h
-        return predict_flood_risk(
-            rainfall_24h=p.rainfall_24h,
-            rainfall_7d=p.rainfall_7d,
-            predicted_rainfall_24h=predicted,
-            soil_moisture=p.soil_moisture,
-            river_level=p.river_level,
-            slope=p.slope,
-        )
-    except RuntimeError:
-        # Development fallback if the model files have not been trained yet.
-        score = 0
-        if p.rainfall_24h >= 120: score += 45
-        elif p.rainfall_24h >= 80: score += 35
-        elif p.rainfall_24h >= 50: score += 22
-        elif p.rainfall_24h >= 25: score += 10
-        if p.rainfall_7d >= 300: score += 30
-        elif p.rainfall_7d >= 200: score += 22
-        elif p.rainfall_7d >= 120: score += 12
-        if p.soil_moisture >= 90: score += 20
-        elif p.soil_moisture >= 75: score += 12
-        elif p.soil_moisture >= 60: score += 6
-        if p.river_level >= 3: score += 15
-        elif p.river_level >= 2: score += 9
-        elif p.river_level >= 1.5: score += 4
-        if p.slope.lower() == "steep": score += 8
-        elif p.slope.lower() == "moderate": score += 3
-        score = min(100, score)
-        label = "HIGH" if score >= 65 else "MEDIUM" if score >= 35 else "LOW"
-        actions = {
-            "LOW": ["Continue normal monitoring.", "Keep drainage channels clear."],
-            "MEDIUM": ["Inspect drainage and low-lying areas.", "Monitor local river and rainfall conditions."],
-            "HIGH": ["Avoid unnecessary field operations during severe rainfall.", "Inspect drainage and vulnerable slopes."],
-        }
-        return {
-            "score": score,
-            "risk": label,
-            "confidence": None,
-            "actions": actions[label],
-            "model": "Development fallback — train Random Forest with historical flood records",
-        }
-
 
 def rank_schemes(db, crops, district, needs):
     schemes = db.query(Scheme).all()
@@ -604,17 +545,67 @@ def weather_demo():
     }
 
 
+# In-memory caches. These keep the UI usable during short Open-Meteo outages.
+_WEATHER_CACHE: dict[str, dict] = {}
+_HISTORY_CACHE: dict[str, list[dict]] = {}
+
+
+async def _open_meteo_json(url: str, params: dict, attempts: int = 3):
+    """GET JSON from Open-Meteo with short exponential-backoff retries."""
+    last_error = None
+
+    timeout = httpx.Timeout(15.0, connect=5.0)
+    async with httpx.AsyncClient(timeout=timeout) as client:
+        for attempt in range(attempts):
+            try:
+                response = await client.get(url, params=params)
+
+                # Retry temporary rate-limit/server errors.
+                if response.status_code in {408, 429, 500, 502, 503, 504}:
+                    last_error = RuntimeError(
+                        f"Open-Meteo returned HTTP {response.status_code}"
+                    )
+                    if attempt < attempts - 1:
+                        retry_after = response.headers.get("Retry-After")
+                        try:
+                            delay = min(float(retry_after), 5.0) if retry_after else 0.8 * (2 ** attempt)
+                        except ValueError:
+                            delay = 0.8 * (2 ** attempt)
+
+                        import asyncio
+                        await asyncio.sleep(delay)
+                        continue
+
+                response.raise_for_status()
+                return response.json()
+
+            except (httpx.RequestError, httpx.HTTPStatusError, ValueError) as exc:
+                last_error = exc
+                if attempt < attempts - 1:
+                    import asyncio
+                    await asyncio.sleep(0.8 * (2 ** attempt))
+                    continue
+
+    raise last_error or RuntimeError("Unknown Open-Meteo error")
+
+
 async def _geocode_open_meteo(city: str):
     """Resolve a city/place name to coordinates using Open-Meteo Geocoding."""
     url = "https://geocoding-api.open-meteo.com/v1/search"
-    params = {"name": city, "count": 1, "language": "en", "format": "json"}
+    params = {
+        "name": city.strip(),
+        "count": 1,
+        "language": "en",
+        "format": "json",
+    }
+
     try:
-        async with httpx.AsyncClient(timeout=10) as client:
-            response = await client.get(url, params=params)
-            response.raise_for_status()
-            data = response.json()
-    except (httpx.RequestError, httpx.HTTPStatusError):
-        raise HTTPException(502, "Unable to reach Open-Meteo geocoding service right now.")
+        data = await _open_meteo_json(url, params)
+    except Exception as exc:
+        raise HTTPException(
+            502,
+            f"Unable to reach Open-Meteo geocoding service after retries: {exc}",
+        )
 
     results = data.get("results") or []
     if not results:
@@ -659,105 +650,275 @@ def _weather_condition(code: int) -> str:
     return mapping.get(code, "Unknown")
 
 
-async def live_weather(city: str):
-    """Fetch real current + five-day weather data from Open-Meteo."""
-    location = await _geocode_open_meteo(city)
+def _weather_demo_for_city(city: str):
+    """Explicit demo fallback when live weather is temporarily unavailable."""
+    base = datetime.now()
+    demo = weather_demo()
+    demo["location"] = city.strip() or demo["location"]
+    demo["source"] = "Demo fallback — Open-Meteo temporarily unavailable"
+    demo["source_url"] = "https://open-meteo.com/"
+    demo["warning"] = "Live weather service was temporarily unavailable; demo values are being shown."
+    for i, day in enumerate(demo["forecast"]):
+        day["date"] = (base + timedelta(days=i)).strftime("%Y-%m-%d")
+    return demo
 
-    forecast_url = "https://api.open-meteo.com/v1/forecast"
+
+async def live_weather(city: str):
+    """Fetch real current + five-day weather data from Open-Meteo.
+
+    The function retries temporary Open-Meteo failures and falls back to the
+    last successful response for the same city, then to clearly labelled demo
+    data.
+    """
+    city_key = city.strip().lower()
+
+    try:
+        location = await _geocode_open_meteo(city)
+
+        forecast_url = "https://api.open-meteo.com/v1/forecast"
+        params = {
+            "latitude": location["latitude"],
+            "longitude": location["longitude"],
+            "current": ",".join([
+                "temperature_2m",
+                "relative_humidity_2m",
+                "precipitation",
+                "weather_code",
+                "wind_speed_10m",
+            ]),
+            "hourly": ",".join([
+                "temperature_2m",
+                "relative_humidity_2m",
+                "precipitation_probability",
+                "precipitation",
+                "weather_code",
+                "wind_speed_10m",
+            ]),
+            "daily": ",".join([
+                "weather_code",
+                "temperature_2m_max",
+                "temperature_2m_min",
+                "precipitation_sum",
+                "precipitation_probability_max",
+            ]),
+            "forecast_days": 5,
+            "timezone": "auto",
+            "temperature_unit": "celsius",
+            "wind_speed_unit": "kmh",
+            "precipitation_unit": "mm",
+        }
+
+        data = await _open_meteo_json(forecast_url, params)
+
+        current = data.get("current", {})
+        daily = data.get("daily", {})
+        hourly = data.get("hourly", {})
+
+        hourly_probs = hourly.get("precipitation_probability") or []
+        rain_probability = int(round(float(hourly_probs[0]))) if hourly_probs else 0
+
+        dates = daily.get("time", [])
+        codes = daily.get("weather_code", [])
+        max_temps = daily.get("temperature_2m_max", [])
+        min_temps = daily.get("temperature_2m_min", [])
+        rainfall = daily.get("precipitation_sum", [])
+        rain_probs = daily.get("precipitation_probability_max", [])
+
+        forecast = []
+        for i, date in enumerate(dates[:5]):
+            code = codes[i] if i < len(codes) else 0
+            forecast.append({
+                "date": date,
+                "temperature_c": round(float((max_temps[i] + min_temps[i]) / 2), 1)
+                    if i < len(max_temps) and i < len(min_temps) else None,
+                "min_temperature_c": round(float(min_temps[i]), 1)
+                    if i < len(min_temps) else None,
+                "max_temperature_c": round(float(max_temps[i]), 1)
+                    if i < len(max_temps) else None,
+                "rain_probability": int(round(float(rain_probs[i])))
+                    if i < len(rain_probs) else 0,
+                "rainfall_mm": round(float(rainfall[i]), 1)
+                    if i < len(rainfall) else 0,
+                "condition": _weather_condition(code),
+            })
+
+        location_name = location.get("name", city)
+        admin1 = location.get("admin1")
+        country = location.get("country")
+        display_location = ", ".join(
+            x for x in [location_name, admin1, country] if x
+        )
+
+        result = {
+            "location": display_location,
+            "coordinates": {
+                "latitude": location["latitude"],
+                "longitude": location["longitude"],
+            },
+            "current": {
+                "temperature_c": round(float(current.get("temperature_2m", 0)), 1),
+                "humidity": int(round(float(current.get("relative_humidity_2m", 0)))),
+                "rain_probability": rain_probability,
+                "rainfall_mm": round(float(current.get("precipitation", 0)), 1),
+                "condition": _weather_condition(current.get("weather_code", 0)),
+                "wind_kmh": round(float(current.get("wind_speed_10m", 0)), 1),
+            },
+            "forecast": forecast,
+            "source": "Open-Meteo",
+            "source_url": "https://open-meteo.com/",
+        }
+
+        _WEATHER_CACHE[city_key] = result
+        return result
+
+    except HTTPException:
+        # Geocoding errors such as an invalid location should still be shown
+        # to the user rather than silently changing the requested location.
+        cached = _WEATHER_CACHE.get(city_key)
+        if cached:
+            return {**cached, "source": "Cached Open-Meteo data"}
+        raise
+
+    except Exception as exc:
+        cached = _WEATHER_CACHE.get(city_key)
+        if cached:
+            return {
+                **cached,
+                "source": "Cached Open-Meteo data",
+                "warning": f"Live Open-Meteo data was temporarily unavailable: {exc}",
+            }
+
+        return _weather_demo_for_city(city)
+
+
+def _read_historical_csv():
+    """Read the bundled demo historical dataset if available.
+
+    The fallback accepts common column names so small changes to the demo CSV
+    do not break the weather page.
+    """
+    import csv
+
+    path = Path(__file__).resolve().parent / "data" / "historical_weather_demo.csv"
+    if not path.exists():
+        return []
+
+    try:
+        with path.open("r", encoding="utf-8-sig", newline="") as handle:
+            rows = list(csv.DictReader(handle))
+    except (OSError, csv.Error):
+        return []
+
+    def value(row, *names, default=0.0):
+        lowered = {str(k).strip().lower(): v for k, v in row.items()}
+        for name in names:
+            raw = lowered.get(name.lower())
+            if raw not in (None, ""):
+                try:
+                    return float(raw)
+                except (TypeError, ValueError):
+                    pass
+        return default
+
+    history = []
+    for row in rows:
+        date = (
+            row.get("date")
+            or row.get("Date")
+            or row.get("DATE")
+        )
+        if not date:
+            continue
+
+        history.append({
+            "date": str(date),
+            "rainfall_mm": value(
+                row, "rainfall_mm", "rainfall", "precipitation_mm", "precipitation"
+            ),
+            "temperature_c": value(
+                row, "temperature_c", "temperature", "temp", default=25
+            ),
+            "humidity": value(
+                row, "humidity", "relative_humidity", default=70
+            ),
+            "pressure_hpa": value(
+                row, "pressure_hpa", "pressure", "surface_pressure", default=1013
+            ),
+        })
+
+    return history
+
+
+async def _historical_weather(city: str, location: dict):
+    """Retrieve 21 days of historical weather with retry + CSV/cache fallback."""
+    city_key = city.strip().lower()
+
+    today = datetime.now(timezone.utc).date()
+    start_date = today - timedelta(days=21)
+    end_date = today - timedelta(days=1)
+
     params = {
         "latitude": location["latitude"],
         "longitude": location["longitude"],
-        "current": ",".join([
-            "temperature_2m",
-            "relative_humidity_2m",
-            "precipitation",
-            "weather_code",
-            "wind_speed_10m",
-        ]),
-        "hourly": ",".join([
-            "temperature_2m",
-            "relative_humidity_2m",
-            "precipitation_probability",
-            "precipitation",
-            "weather_code",
-            "wind_speed_10m",
-        ]),
+        "start_date": start_date.isoformat(),
+        "end_date": end_date.isoformat(),
         "daily": ",".join([
-            "weather_code",
-            "temperature_2m_max",
-            "temperature_2m_min",
             "precipitation_sum",
-            "precipitation_probability_max",
+            "temperature_2m_mean",
+            "relative_humidity_2m_mean",
+            "surface_pressure_mean",
         ]),
-        "forecast_days": 5,
         "timezone": "auto",
         "temperature_unit": "celsius",
-        "wind_speed_unit": "kmh",
         "precipitation_unit": "mm",
     }
 
     try:
-        async with httpx.AsyncClient(timeout=10) as client:
-            response = await client.get(forecast_url, params=params)
-            response.raise_for_status()
-            data = response.json()
-    except httpx.HTTPStatusError:
-        raise HTTPException(502, "Open-Meteo could not provide weather data right now.")
-    except (httpx.RequestError, KeyError, ValueError, TypeError):
-        raise HTTPException(502, "Unable to reach Open-Meteo right now. Please try again.")
+        data = await _open_meteo_json(
+            "https://archive-api.open-meteo.com/v1/archive",
+            params,
+        )
 
-    current = data.get("current", {})
-    daily = data.get("daily", {})
-    hourly = data.get("hourly", {})
+        daily = data.get("daily", {})
+        dates = daily.get("time", [])
+        rain = daily.get("precipitation_sum", [])
+        temps = daily.get("temperature_2m_mean", [])
+        humidity = daily.get("relative_humidity_2m_mean", [])
+        pressure = daily.get("surface_pressure_mean", [])
 
-    # Use the first upcoming hourly period for near-term rain probability.
-    hourly_probs = hourly.get("precipitation_probability") or []
-    rain_probability = int(round(float(hourly_probs[0]))) if hourly_probs else 0
+        history = []
+        for i, date in enumerate(dates):
+            if i >= len(rain):
+                continue
+            history.append({
+                "date": date,
+                "rainfall_mm": float(rain[i] or 0),
+                "temperature_c": float(temps[i] or 25),
+                "humidity": float(humidity[i] or 70),
+                "pressure_hpa": float(pressure[i] or 1013),
+            })
 
-    dates = daily.get("time", [])
-    codes = daily.get("weather_code", [])
-    max_temps = daily.get("temperature_2m_max", [])
-    min_temps = daily.get("temperature_2m_min", [])
-    rainfall = daily.get("precipitation_sum", [])
-    rain_probs = daily.get("precipitation_probability_max", [])
+        if len(history) >= 14:
+            _HISTORY_CACHE[city_key] = history
+            return history, "Open-Meteo historical weather data"
 
-    forecast = []
-    for i, date in enumerate(dates[:5]):
-        code = codes[i] if i < len(codes) else 0
-        forecast.append({
-            "date": date,
-            "temperature_c": round(float((max_temps[i] + min_temps[i]) / 2), 1)
-                if i < len(max_temps) and i < len(min_temps) else None,
-            "min_temperature_c": round(float(min_temps[i]), 1) if i < len(min_temps) else None,
-            "max_temperature_c": round(float(max_temps[i]), 1) if i < len(max_temps) else None,
-            "rain_probability": int(round(float(rain_probs[i]))) if i < len(rain_probs) else 0,
-            "rainfall_mm": round(float(rainfall[i]), 1) if i < len(rainfall) else 0,
-            "condition": _weather_condition(code),
-        })
+    except Exception:
+        pass
 
-    location_name = location.get("name", city)
-    admin1 = location.get("admin1")
-    country = location.get("country")
-    display_location = ", ".join(x for x in [location_name, admin1, country] if x)
+    # First fallback: last successful historical data for this city.
+    cached = _HISTORY_CACHE.get(city_key)
+    if cached and len(cached) >= 14:
+        return cached, "Cached Open-Meteo historical weather data"
 
-    return {
-        "location": display_location,
-        "coordinates": {
-            "latitude": location["latitude"],
-            "longitude": location["longitude"],
-        },
-        "current": {
-            "temperature_c": round(float(current.get("temperature_2m", 0)), 1),
-            "humidity": int(round(float(current.get("relative_humidity_2m", 0)))),
-            "rain_probability": rain_probability,
-            "rainfall_mm": round(float(current.get("precipitation", 0)), 1),
-            "condition": _weather_condition(current.get("weather_code", 0)),
-            "wind_kmh": round(float(current.get("wind_speed_10m", 0)), 1),
-        },
-        "forecast": forecast,
-        "source": "Open-Meteo",
-        "source_url": "https://open-meteo.com/",
-    }
+    # Second fallback: bundled demo dataset.
+    demo = _read_historical_csv()
+    if len(demo) >= 14:
+        return demo[-21:], "Bundled demo historical weather data"
+
+    raise HTTPException(
+        503,
+        "Historical weather is temporarily unavailable and no fallback dataset is available.",
+    )
 
 
 # -------------------------------------------------------------------
@@ -792,7 +953,6 @@ def dashboard(db: Session = Depends(get_db)):
         },
         "stats": {
             "weather": "24°C",
-            "flood_risk": "LOW",
             "wildlife": "No recent intrusion",
             "schemes": db.query(Scheme).count(),
             "equipment": db.query(Equipment).filter(Equipment.available == True).count(),
@@ -849,10 +1009,6 @@ def advisory(payload: AdvisoryRequest):
 async def weather(city: str = "Idukki, Kerala"):
     return await live_weather(city)
 
-@app.post("/api/risk/flood")
-def flood_risk(payload: RiskRequest):
-    return flood_risk_engine(payload)
-
 @app.post("/api/weather/forecast")
 def forecast(history: list[dict] = []):
     if not history:
@@ -864,54 +1020,13 @@ def forecast(history: list[dict] = []):
 
 @app.get("/api/weather/ai-forecast")
 async def ai_forecast(city: str = "Idukki, Kerala"):
-    """Use recent Weather API observations as input to the trained LSTM."""
+    """Use historical weather observations as input to the trained LSTM.
+
+    Open-Meteo archive failures are retried. If the archive is temporarily
+    unavailable, the endpoint uses cached history or the bundled demo dataset.
+    """
     location = await _geocode_open_meteo(city)
-    today = datetime.now(timezone.utc).date()
-    start_date = today - timedelta(days=21)
-    end_date = today - timedelta(days=1)
-
-    params = {
-        "latitude": location["latitude"],
-        "longitude": location["longitude"],
-        "start_date": start_date.isoformat(),
-        "end_date": end_date.isoformat(),
-        "daily": ",".join([
-            "precipitation_sum",
-            "temperature_2m_mean",
-            "relative_humidity_2m_mean",
-            "surface_pressure_mean",
-        ]),
-        "timezone": "auto",
-        "temperature_unit": "celsius",
-        "precipitation_unit": "mm",
-    }
-
-    try:
-        async with httpx.AsyncClient(timeout=10) as client:
-            response = await client.get("https://archive-api.open-meteo.com/v1/archive", params=params)
-            response.raise_for_status()
-            data = response.json()
-    except (httpx.HTTPStatusError, httpx.RequestError, KeyError, ValueError, TypeError) as exc:
-        raise HTTPException(502, f"Unable to retrieve historical weather data: {exc}")
-
-    daily = data.get("daily", {})
-    dates = daily.get("time", [])
-    rain = daily.get("precipitation_sum", [])
-    temps = daily.get("temperature_2m_mean", [])
-    humidity = daily.get("relative_humidity_2m_mean", [])
-    pressure = daily.get("surface_pressure_mean", [])
-
-    history = []
-    for i, date in enumerate(dates):
-        if i >= len(rain):
-            continue
-        history.append({
-            "date": date,
-            "rainfall_mm": float(rain[i] or 0),
-            "temperature_c": float(temps[i] or 25),
-            "humidity": float(humidity[i] or 70),
-            "pressure_hpa": float(pressure[i] or 1013),
-        })
+    history, history_source = await _historical_weather(city, location)
 
     try:
         predictions = predict_rainfall(history, steps=3)
@@ -920,14 +1035,16 @@ async def ai_forecast(city: str = "Idukki, Kerala"):
 
     recent_24h = round(float(history[-1]["rainfall_mm"]) if history else 0.0, 1)
     recent_7d = round(sum(x["rainfall_mm"] for x in history[-7:]), 1)
+
     return {
         "location": location.get("name", city),
         "recent_rainfall_24h": recent_24h,
         "recent_rainfall_7d": recent_7d,
         "history_days_used": len(history),
         "forecast": predictions,
-        "source": "Open-Meteo historical weather data",
+        "source": history_source,
     }
+
 
 @app.get("/api/risk/farm")
 def farm_risk(db: Session = Depends(get_db)):
