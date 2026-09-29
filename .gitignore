@@ -6,3 +6,8 @@ dist/
 .env
 *.db
 backend/models/*.pt
+
+backend/models/*.pt
+backend/models/*.joblib
+backend/models/*.json
+backend/krishimitra.db

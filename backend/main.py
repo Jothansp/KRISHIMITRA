@@ -18,6 +18,7 @@ from sqlalchemy import (
 from sqlalchemy.orm import declarative_base, sessionmaker, Session
 from sklearn.feature_extraction.text import TfidfVectorizer
 from sklearn.metrics.pairwise import cosine_similarity
+from ml_models import predict_flood_risk, predict_rainfall, load_models
 
 # -------------------------------------------------------------------
 # Configuration
@@ -339,6 +340,7 @@ class AdvisoryRequest(BaseModel):
 class RiskRequest(BaseModel):
     rainfall_24h: float = 35
     rainfall_7d: float = 100
+    predicted_rainfall_24h: float = 0
     soil_moisture: float = 55
     river_level: float = 1.0
     slope: str = "moderate"
@@ -444,56 +446,55 @@ def advisory_engine(p):
     }
 
 def flood_risk_engine(p):
-    score = 0
+    """ML-first flood risk prediction.
 
-    if p.rainfall_24h >= 120: score += 45
-    elif p.rainfall_24h >= 80: score += 35
-    elif p.rainfall_24h >= 50: score += 22
-    elif p.rainfall_24h >= 25: score += 10
+    The Random Forest is trained from historical environmental + flood records.
+    A small rule-based fallback is retained only for development when the model
+    has not yet been trained.
+    """
+    try:
+        predicted = p.predicted_rainfall_24h or p.rainfall_24h
+        return predict_flood_risk(
+            rainfall_24h=p.rainfall_24h,
+            rainfall_7d=p.rainfall_7d,
+            predicted_rainfall_24h=predicted,
+            soil_moisture=p.soil_moisture,
+            river_level=p.river_level,
+            slope=p.slope,
+        )
+    except RuntimeError:
+        # Development fallback if the model files have not been trained yet.
+        score = 0
+        if p.rainfall_24h >= 120: score += 45
+        elif p.rainfall_24h >= 80: score += 35
+        elif p.rainfall_24h >= 50: score += 22
+        elif p.rainfall_24h >= 25: score += 10
+        if p.rainfall_7d >= 300: score += 30
+        elif p.rainfall_7d >= 200: score += 22
+        elif p.rainfall_7d >= 120: score += 12
+        if p.soil_moisture >= 90: score += 20
+        elif p.soil_moisture >= 75: score += 12
+        elif p.soil_moisture >= 60: score += 6
+        if p.river_level >= 3: score += 15
+        elif p.river_level >= 2: score += 9
+        elif p.river_level >= 1.5: score += 4
+        if p.slope.lower() == "steep": score += 8
+        elif p.slope.lower() == "moderate": score += 3
+        score = min(100, score)
+        label = "HIGH" if score >= 65 else "MEDIUM" if score >= 35 else "LOW"
+        actions = {
+            "LOW": ["Continue normal monitoring.", "Keep drainage channels clear."],
+            "MEDIUM": ["Inspect drainage and low-lying areas.", "Monitor local river and rainfall conditions."],
+            "HIGH": ["Avoid unnecessary field operations during severe rainfall.", "Inspect drainage and vulnerable slopes."],
+        }
+        return {
+            "score": score,
+            "risk": label,
+            "confidence": None,
+            "actions": actions[label],
+            "model": "Development fallback — train Random Forest with historical flood records",
+        }
 
-    if p.rainfall_7d >= 300: score += 30
-    elif p.rainfall_7d >= 200: score += 22
-    elif p.rainfall_7d >= 120: score += 12
-
-    if p.soil_moisture >= 90: score += 20
-    elif p.soil_moisture >= 75: score += 12
-    elif p.soil_moisture >= 60: score += 6
-
-    if p.river_level >= 3: score += 15
-    elif p.river_level >= 2: score += 9
-    elif p.river_level >= 1.5: score += 4
-
-    if p.slope.lower() == "steep":
-        score += 8
-    elif p.slope.lower() == "moderate":
-        score += 3
-
-    score = min(100, score)
-    label = "HIGH" if score >= 65 else "MEDIUM" if score >= 35 else "LOW"
-
-    actions = {
-        "LOW": [
-            "Continue normal monitoring.",
-            "Keep drainage channels clear.",
-        ],
-        "MEDIUM": [
-            "Inspect drainage and low-lying areas.",
-            "Review field operations before heavy rainfall.",
-            "Monitor local river and rainfall conditions.",
-        ],
-        "HIGH": [
-            "Avoid unnecessary field operations during severe rainfall.",
-            "Inspect drainage and vulnerable slopes.",
-            "Follow local official warnings where applicable.",
-        ],
-    }
-
-    return {
-        "score": score,
-        "risk": label,
-        "actions": actions[label],
-        "model": "Random Forest-compatible risk pipeline",
-    }
 
 def rank_schemes(db, crops, district, needs):
     schemes = db.query(Scheme).all()
@@ -659,56 +660,36 @@ def _weather_condition(code: int) -> str:
 
 
 async def live_weather(city: str):
-    """Fetch real current, hourly and five-day weather data from Open-Meteo."""
+    """Fetch real current + five-day weather data from Open-Meteo."""
     location = await _geocode_open_meteo(city)
 
     forecast_url = "https://api.open-meteo.com/v1/forecast"
-
     params = {
         "latitude": location["latitude"],
         "longitude": location["longitude"],
-
         "current": ",".join([
             "temperature_2m",
-            "apparent_temperature",
             "relative_humidity_2m",
             "precipitation",
             "weather_code",
             "wind_speed_10m",
-            "wind_direction_10m",
-            "uv_index",
         ]),
-
         "hourly": ",".join([
             "temperature_2m",
-            "apparent_temperature",
             "relative_humidity_2m",
             "precipitation_probability",
             "precipitation",
             "weather_code",
             "wind_speed_10m",
-            "wind_direction_10m",
-            "soil_moisture_0_to_7cm",
         ]),
-
         "daily": ",".join([
             "weather_code",
             "temperature_2m_max",
             "temperature_2m_min",
-            "apparent_temperature_max",
-            "apparent_temperature_min",
             "precipitation_sum",
             "precipitation_probability_max",
-            "uv_index_max",
-            "wind_speed_10m_max",
-            "wind_direction_10m_dominant",
         ]),
-
-        # Include recent weather data so rainfall can be calculated
-        # for the previous 24 hours and 7 days.
-        "past_days": 7,
         "forecast_days": 5,
-
         "timezone": "auto",
         "temperature_unit": "celsius",
         "wind_speed_unit": "kmh",
@@ -716,442 +697,68 @@ async def live_weather(city: str):
     }
 
     try:
-        async with httpx.AsyncClient(timeout=15) as client:
+        async with httpx.AsyncClient(timeout=10) as client:
             response = await client.get(forecast_url, params=params)
             response.raise_for_status()
             data = response.json()
-
     except httpx.HTTPStatusError:
-        raise HTTPException(
-            502,
-            "Open-Meteo could not provide weather data right now."
-        )
-
+        raise HTTPException(502, "Open-Meteo could not provide weather data right now.")
     except (httpx.RequestError, KeyError, ValueError, TypeError):
-        raise HTTPException(
-            502,
-            "Unable to reach Open-Meteo right now. Please try again."
-        )
+        raise HTTPException(502, "Unable to reach Open-Meteo right now. Please try again.")
 
     current = data.get("current", {})
-    hourly = data.get("hourly", {})
     daily = data.get("daily", {})
+    hourly = data.get("hourly", {})
 
-    # ---------------------------------------------------------------
-    # Current weather
-    # ---------------------------------------------------------------
-
-    current_time = current.get("time")
-
-    hourly_times = hourly.get("time", [])
-    hourly_rain = hourly.get("precipitation", [])
-    hourly_rain_probability = hourly.get("precipitation_probability", [])
-    hourly_soil = hourly.get("soil_moisture_0_to_7cm", [])
-
-    # Find the hourly index corresponding to the current hour.
-    current_index = 0
-
-    if current_time and hourly_times:
-        try:
-            from datetime import datetime
-
-            current_dt = datetime.fromisoformat(current_time)
-
-            hourly_dates = [
-                datetime.fromisoformat(t)
-                for t in hourly_times
-            ]
-
-            # Find the first hourly forecast at or after
-            # the current weather observation.
-            future_indices = [
-                i
-                for i, dt in enumerate(hourly_dates)
-                if dt >= current_dt
-            ]
-
-            if future_indices:
-                current_index = future_indices[0]
-
-        except (ValueError, TypeError):
-            current_index = 0
-
-    # ---------------------------------------------------------------
-    # Rain probability
-    # ---------------------------------------------------------------
-
-    rain_probability = 0
-
-    if (
-        current_index < len(hourly_rain_probability)
-        and hourly_rain_probability[current_index] is not None
-    ):
-        rain_probability = int(
-            round(float(hourly_rain_probability[current_index]))
-        )
-
-    # ---------------------------------------------------------------
-    # Rainfall calculations
-    # ---------------------------------------------------------------
-
-    rainfall_24h = 0.0
-    rainfall_7d = 0.0
-
-    # The API returns hourly data covering the previous 7 days.
-    # Calculate the rainfall using the most recent hours.
-    if hourly_rain:
-        valid_rain = [
-            float(x) for x in hourly_rain
-            if x is not None
-        ]
-
-        if valid_rain:
-            rainfall_24h = sum(valid_rain[-24:])
-            rainfall_7d = sum(valid_rain[-168:])
-
-    # ---------------------------------------------------------------
-    # Soil moisture
-    # ---------------------------------------------------------------
-
-    soil_moisture = None
-
-    if (
-        current_index < len(hourly_soil)
-        and hourly_soil[current_index] is not None
-    ):
-        # Open-Meteo provides volumetric soil moisture.
-        # Convert m³/m³ to a percentage for the UI.
-        soil_moisture = round(
-            float(hourly_soil[current_index]) * 100,
-            1
-        )
-
-    # ---------------------------------------------------------------
-    # Five-day forecast
-    # ---------------------------------------------------------------
+    # Use the first upcoming hourly period for near-term rain probability.
+    hourly_probs = hourly.get("precipitation_probability") or []
+    rain_probability = int(round(float(hourly_probs[0]))) if hourly_probs else 0
 
     dates = daily.get("time", [])
     codes = daily.get("weather_code", [])
     max_temps = daily.get("temperature_2m_max", [])
     min_temps = daily.get("temperature_2m_min", [])
-    apparent_max = daily.get("apparent_temperature_max", [])
-    apparent_min = daily.get("apparent_temperature_min", [])
     rainfall = daily.get("precipitation_sum", [])
     rain_probs = daily.get("precipitation_probability_max", [])
-    uv_indexes = daily.get("uv_index_max", [])
-    wind_max = daily.get("wind_speed_10m_max", [])
-    wind_direction = daily.get("wind_direction_10m_dominant", [])
 
     forecast = []
-
-    # Open-Meteo returns the 7 past days first because
-    # past_days=7 was requested. We only want the
-    # upcoming 5 forecast days.
-    forecast_start = max(0, len(dates) - 5)
-
-    for i in range(forecast_start, len(dates)):
-        date = dates[i]
-
-        code = (
-            codes[i]
-            if i < len(codes)
-            else 0
-        )
-
+    for i, date in enumerate(dates[:5]):
+        code = codes[i] if i < len(codes) else 0
         forecast.append({
             "date": date,
-
-            "temperature_c": (
-                round(float(max_temps[i]), 1)
-                if i < len(max_temps)
-                else None
-            ),
-
-            "min_temperature_c": (
-                round(float(min_temps[i]), 1)
-                if i < len(min_temps)
-                else None
-            ),
-
-            "max_temperature_c": (
-                round(float(max_temps[i]), 1)
-                if i < len(max_temps)
-                else None
-            ),
-
-            "apparent_max_c": (
-                round(float(apparent_max[i]), 1)
-                if i < len(apparent_max)
-                else None
-            ),
-
-            "apparent_min_c": (
-                round(float(apparent_min[i]), 1)
-                if i < len(apparent_min)
-                else None
-            ),
-
-            "rain_probability": (
-                int(round(float(rain_probs[i])))
-                if i < len(rain_probs)
-                else 0
-            ),
-
-            "rainfall_mm": (
-                round(float(rainfall[i]), 1)
-                if i < len(rainfall)
-                else 0
-            ),
-
-            "uv_index": (
-                round(float(uv_indexes[i]), 1)
-                if i < len(uv_indexes)
-                else None
-            ),
-
-            "wind_kmh": (
-                round(float(wind_max[i]), 1)
-                if i < len(wind_max)
-                else None
-            ),
-
-            "wind_direction": (
-                int(round(float(wind_direction[i])))
-                if i < len(wind_direction)
-                else None
-            ),
-
+            "temperature_c": round(float((max_temps[i] + min_temps[i]) / 2), 1)
+                if i < len(max_temps) and i < len(min_temps) else None,
+            "min_temperature_c": round(float(min_temps[i]), 1) if i < len(min_temps) else None,
+            "max_temperature_c": round(float(max_temps[i]), 1) if i < len(max_temps) else None,
+            "rain_probability": int(round(float(rain_probs[i]))) if i < len(rain_probs) else 0,
+            "rainfall_mm": round(float(rainfall[i]), 1) if i < len(rainfall) else 0,
             "condition": _weather_condition(code),
         })
-
-    # ---------------------------------------------------------------
-    # Hourly forecast
-    # ---------------------------------------------------------------
-
-    hourly_forecast = []
-
-    # Show the next 12 hours.
-    start = current_index
-    end = min(start + 12, len(hourly_times))
-
-    for i in range(start, end):
-
-        hourly_forecast.append({
-            "time": hourly_times[i],
-
-            "temperature_c": (
-                round(float(hourly.get("temperature_2m", [])[i]), 1)
-                if i < len(hourly.get("temperature_2m", []))
-                else None
-            ),
-
-            "apparent_temperature_c": (
-                round(
-                    float(
-                        hourly.get("apparent_temperature", [])[i]
-                    ),
-                    1
-                )
-                if i < len(hourly.get("apparent_temperature", []))
-                else None
-            ),
-
-            "humidity": (
-                int(
-                    round(
-                        float(
-                            hourly.get(
-                                "relative_humidity_2m",
-                                []
-                            )[i]
-                        )
-                    )
-                )
-                if i < len(
-                    hourly.get(
-                        "relative_humidity_2m",
-                        []
-                    )
-                )
-                else None
-            ),
-
-            "rain_probability": (
-                int(
-                    round(
-                        float(
-                            hourly.get(
-                                "precipitation_probability",
-                                []
-                            )[i]
-                        )
-                    )
-                )
-                if i < len(
-                    hourly.get(
-                        "precipitation_probability",
-                        []
-                    )
-                )
-                else 0
-            ),
-
-            "rainfall_mm": (
-                round(
-                    float(
-                        hourly.get(
-                            "precipitation",
-                            []
-                        )[i]
-                    ),
-                    1
-                )
-                if i < len(
-                    hourly.get(
-                        "precipitation",
-                        []
-                    )
-                )
-                else 0
-            ),
-
-            "wind_kmh": (
-                round(
-                    float(
-                        hourly.get(
-                            "wind_speed_10m",
-                            []
-                        )[i]
-                    ),
-                    1
-                )
-                if i < len(
-                    hourly.get(
-                        "wind_speed_10m",
-                        []
-                    )
-                )
-                else None
-            ),
-
-            "condition": _weather_condition(
-                hourly.get("weather_code", [0])[i]
-            ),
-        })
-
-    # ---------------------------------------------------------------
-    # Location
-    # ---------------------------------------------------------------
 
     location_name = location.get("name", city)
     admin1 = location.get("admin1")
     country = location.get("country")
-
-    display_location = ", ".join(
-        x for x in [
-            location_name,
-            admin1,
-            country
-        ]
-        if x
-    )
-
-    # ---------------------------------------------------------------
-    # Final response
-    # ---------------------------------------------------------------
+    display_location = ", ".join(x for x in [location_name, admin1, country] if x)
 
     return {
         "location": display_location,
-
         "coordinates": {
             "latitude": location["latitude"],
             "longitude": location["longitude"],
         },
-
         "current": {
-            "temperature_c": round(
-                float(current.get("temperature_2m", 0)),
-                1
-            ),
-
-            "feels_like_c": round(
-                float(current.get("apparent_temperature", 0)),
-                1
-            ),
-
-            "humidity": int(
-                round(
-                    float(
-                        current.get(
-                            "relative_humidity_2m",
-                            0
-                        )
-                    )
-                )
-            ),
-
+            "temperature_c": round(float(current.get("temperature_2m", 0)), 1),
+            "humidity": int(round(float(current.get("relative_humidity_2m", 0)))),
             "rain_probability": rain_probability,
-
-            "rainfall_mm": round(
-                float(
-                    current.get(
-                        "precipitation",
-                        0
-                    )
-                ),
-                1
-            ),
-
-            "condition": _weather_condition(
-                current.get("weather_code", 0)
-            ),
-
-            "wind_kmh": round(
-                float(
-                    current.get(
-                        "wind_speed_10m",
-                        0
-                    )
-                ),
-                1
-            ),
-
-            "wind_direction": int(
-                round(
-                    float(
-                        current.get(
-                            "wind_direction_10m",
-                            0
-                        )
-                    )
-                )
-            ),
-
-            "uv_index": round(
-                float(
-                    current.get(
-                        "uv_index",
-                        0
-                    )
-                ),
-                1
-            ),
+            "rainfall_mm": round(float(current.get("precipitation", 0)), 1),
+            "condition": _weather_condition(current.get("weather_code", 0)),
+            "wind_kmh": round(float(current.get("wind_speed_10m", 0)), 1),
         },
-
-        "risk_inputs": {
-            "rainfall_24h": round(rainfall_24h, 1),
-            "rainfall_7d": round(rainfall_7d, 1),
-            "soil_moisture": soil_moisture,
-        },
-
         "forecast": forecast,
-
-        "hourly": hourly_forecast,
-
         "source": "Open-Meteo",
-
         "source_url": "https://open-meteo.com/",
     }
+
 
 # -------------------------------------------------------------------
 # API endpoints
@@ -1249,23 +856,78 @@ def flood_risk(payload: RiskRequest):
 @app.post("/api/weather/forecast")
 def forecast(history: list[dict] = []):
     if not history:
-        return weather_demo()["forecast"]
+        raise HTTPException(400, "Provide at least 14 historical weather observations.")
+    try:
+        return predict_rainfall(history, steps=3)
+    except (RuntimeError, ValueError) as exc:
+        raise HTTPException(503, str(exc))
 
-    # LSTM-compatible baseline. Replace with trained LSTM model when available.
-    temps = [float(x.get("temperature_c", 24)) for x in history]
-    rains = [float(x.get("rainfall_mm", 10)) for x in history]
-    humidity = [float(x.get("humidity", 70)) for x in history]
+@app.get("/api/weather/ai-forecast")
+async def ai_forecast(city: str = "Idukki, Kerala"):
+    """Use recent Weather API observations as input to the trained LSTM."""
+    location = await _geocode_open_meteo(city)
+    today = datetime.now(timezone.utc).date()
+    start_date = today - timedelta(days=21)
+    end_date = today - timedelta(days=1)
 
-    return [
-        {
-            "day": i + 1,
-            "temperature_c": round(float(np.mean(temps[-3:])), 1),
-            "rainfall_mm": round(float(np.mean(rains[-3:])), 1),
-            "humidity": round(float(np.mean(humidity[-3:])), 1),
-            "method": "LSTM-compatible baseline",
-        }
-        for i in range(3)
-    ]
+    params = {
+        "latitude": location["latitude"],
+        "longitude": location["longitude"],
+        "start_date": start_date.isoformat(),
+        "end_date": end_date.isoformat(),
+        "daily": ",".join([
+            "precipitation_sum",
+            "temperature_2m_mean",
+            "relative_humidity_2m_mean",
+            "surface_pressure_mean",
+        ]),
+        "timezone": "auto",
+        "temperature_unit": "celsius",
+        "precipitation_unit": "mm",
+    }
+
+    try:
+        async with httpx.AsyncClient(timeout=10) as client:
+            response = await client.get("https://archive-api.open-meteo.com/v1/archive", params=params)
+            response.raise_for_status()
+            data = response.json()
+    except (httpx.HTTPStatusError, httpx.RequestError, KeyError, ValueError, TypeError) as exc:
+        raise HTTPException(502, f"Unable to retrieve historical weather data: {exc}")
+
+    daily = data.get("daily", {})
+    dates = daily.get("time", [])
+    rain = daily.get("precipitation_sum", [])
+    temps = daily.get("temperature_2m_mean", [])
+    humidity = daily.get("relative_humidity_2m_mean", [])
+    pressure = daily.get("surface_pressure_mean", [])
+
+    history = []
+    for i, date in enumerate(dates):
+        if i >= len(rain):
+            continue
+        history.append({
+            "date": date,
+            "rainfall_mm": float(rain[i] or 0),
+            "temperature_c": float(temps[i] or 25),
+            "humidity": float(humidity[i] or 70),
+            "pressure_hpa": float(pressure[i] or 1013),
+        })
+
+    try:
+        predictions = predict_rainfall(history, steps=3)
+    except (RuntimeError, ValueError) as exc:
+        raise HTTPException(503, str(exc))
+
+    recent_24h = round(float(history[-1]["rainfall_mm"]) if history else 0.0, 1)
+    recent_7d = round(sum(x["rainfall_mm"] for x in history[-7:]), 1)
+    return {
+        "location": location.get("name", city),
+        "recent_rainfall_24h": recent_24h,
+        "recent_rainfall_7d": recent_7d,
+        "history_days_used": len(history),
+        "forecast": predictions,
+        "source": "Open-Meteo historical weather data",
+    }
 
 @app.get("/api/risk/farm")
 def farm_risk(db: Session = Depends(get_db)):

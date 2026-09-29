@@ -18,7 +18,7 @@ KrishiMitra implements the project modules from the supplied project specificati
 ## Stack
 
 Frontend:
-- React
+- React + TypeScript
 - Vite
 - React Router
 - Lucide React
@@ -28,12 +28,14 @@ Backend:
 - SQLAlchemy
 - SQLite by default
 - PostgreSQL supported with DATABASE_URL
-- scikit-learn for similarity/risk baseline
+- scikit-learn for Random Forest and similarity models
+- PyTorch for LSTM rainfall forecasting
 
-AI integration points:
-- Rule-based plantation expert system
-- Random Forest-compatible flood-risk pipeline
-- LSTM-compatible weather forecast pipeline
+AI pipeline:
+- LSTM → rainfall forecasting
+- Random Forest → flood-risk classification
+- Weather API → current/forecast weather data
+- Historical rainfall + environmental/flood records → model training
 - YOLOv8 wildlife inference hook
 - TF-IDF + cosine similarity scheme recommender
 - TF-IDF semantic community search
@@ -48,6 +50,11 @@ cd backend
 python -m venv .venv
 .\.venv\Scripts\Activate.ps1
 pip install -r requirements.txt
+
+# Train LSTM + Random Forest
+python train_models.py
+
+# Start FastAPI
 python -m uvicorn main:app --reload --port 8000
 ```
 
@@ -77,12 +84,56 @@ Create `backend/.env` to enable live weather data:
 ```env
 DATABASE_URL=sqlite:///./krishimitra.db
 CORS_ORIGINS=http://localhost:5173
-(no API key required for Open-Meteo non-commercial use)=
 NEWS_API_KEY=
 ```
 
-The weather module is integrated with the Open-Meteo API. Set `(no API key required for Open-Meteo non-commercial use)` in `backend/.env` to enable real-time current weather and a five-day forecast. If the key is not configured, the UI falls back to demo weather data so the rest of the application can still be developed locally.
+The weather module is integrated with the Open-Meteo API. Open-Meteo needs no API key for non-commercial use, so live current weather and a five-day forecast work as soon as the backend can reach the internet. Any place name typed into the Weather page is geocoded by Open-Meteo.
 
 ## Important
 
-The project document specifies YOLOv8, LSTM and Random Forest, but does not provide trained weights or datasets. Therefore the code contains working baseline logic plus clear integration hooks for the trained models. Add your trained files under `backend/models/` when available.
+### ML training data
+
+The project now has a real training pipeline. Put your real dataset at:
+
+`backend/data/historical_weather.csv`
+
+Required columns:
+
+```text
+date,rainfall_mm,temperature_c,humidity,pressure_hpa,river_level,soil_moisture,slope,flood_risk
+```
+
+`flood_risk` must come from real historical flood/event records and contain `LOW`, `MEDIUM`, or `HIGH`.
+
+A clearly labelled `historical_weather_demo.csv` is included only so the application can be tested immediately. **It is synthetic and must not be used as real evidence or reported model performance in the final project.**
+
+The trained models are saved under `backend/models/`.
+
+### How the new AI flow works
+
+```text
+Historical weather + environmental + flood records
+                  │
+        ┌─────────┴─────────┐
+        ▼                   ▼
+      LSTM             Random Forest
+        │                   │
+        ▼                   │
+ Future rainfall ───────────┤
+                            ▼
+                    Flood risk class
+                    LOW / MEDIUM / HIGH
+```
+
+The Weather page can fetch recent historical observations from Open-Meteo, send them to the trained LSTM, and use the predicted next-24-hour rainfall together with recent rainfall, soil moisture, river level and slope for the Random Forest flood-risk prediction.
+
+
+## Frontend scripts
+
+```powershell
+npm run dev        # start Vite
+npm run typecheck  # tsc --noEmit
+npm run build      # typecheck + production build
+```
+
+Shared API response types live in `frontend/src/types/index.ts` and mirror the FastAPI responses in `backend/main.py`.

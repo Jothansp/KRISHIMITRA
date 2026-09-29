@@ -1,23 +1,27 @@
-import React, {useEffect, useState} from "react";
-import {Link} from "react-router-dom";
-import {CloudRain, ShieldCheck, PawPrint, FileText, ArrowRight, Leaf, Droplets, AlertTriangle} from "lucide-react";
-import {api} from "../services/api";
-import {PageHeader, Card, Metric, Loading, Pill} from "../components/UI";
+import { useEffect, useState, type ReactNode } from "react";
+import { Link } from "react-router-dom";
+import { CloudRain, ShieldCheck, PawPrint, FileText, ArrowRight, Leaf, AlertTriangle } from "lucide-react";
+import { api, errorMessage } from "../services/api";
+import { PageHeader, Card, Metric, Loading, Pill, ErrorNote } from "../components/UI";
+import type { Dashboard as DashboardData } from "../types";
 
 export default function Dashboard() {
-  const [data, setData] = useState(null);
+  const [data, setData] = useState<DashboardData | null>(null);
+  const [error, setError] = useState("");
 
   useEffect(() => {
-    api.get("/dashboard").then(setData).catch(console.error);
+    api.get<DashboardData>("/dashboard").then(setData)
+      .catch((e) => setError(errorMessage(e, "Could not reach the KrishiMitra backend.")));
   }, []);
 
-  if (!data) return <Loading/>;
+  if (error) return <ErrorNote message={error} />;
+  if (!data) return <Loading />;
 
-  const metrics = [
-    ["Weather", data.stats.weather, "Current condition", <CloudRain/>],
-    ["Flood Risk", data.stats.flood_risk, "Monsoon assessment", <ShieldCheck/>],
-    ["Wildlife", data.stats.wildlife, "Latest monitoring", <PawPrint/>],
-    ["Schemes", data.stats.schemes, "Available matches", <FileText/>]
+  const metrics: [string, string | number, string, ReactNode][] = [
+    ["Weather", data.stats.weather, "Current condition", <CloudRain />],
+    ["Flood Risk", data.stats.flood_risk, "Monsoon assessment", <ShieldCheck />],
+    ["Wildlife", data.stats.wildlife, "Latest monitoring", <PawPrint />],
+    ["Schemes", data.stats.schemes, "Available matches", <FileText />],
   ];
 
   return (
@@ -26,27 +30,27 @@ export default function Dashboard() {
         eyebrow="SMART PLANTATION MANAGEMENT"
         title={`Hello, ${data.farmer.name}! 👋`}
         description={`${data.farmer.location} • ${data.farmer.farm_size} acres registered`}
-        action={<Link className="icon-button" to="/alerts"><AlertTriangle size={18}/>{data.stats.unread_alerts}</Link>}
+        action={<Link className="icon-button" to="/alerts"><AlertTriangle size={18} />{data.stats.unread_alerts}</Link>}
       />
 
       <section className="hero">
         <div>
           <Pill>KRISHIMITRA AI</Pill>
-          <h2>Healthy plantations.<br/>Safer farms. Better decisions.</h2>
+          <h2>Healthy plantations.<br />Safer farms. Better decisions.</h2>
           <p>AI-powered plantation intelligence, risk management and farmer services in one place.</p>
-          <Link className="primary-button light" to="/advisory">Get today's advisory <ArrowRight size={16}/></Link>
+          <Link className="primary-button light" to="/advisory">Get today's advisory <ArrowRight size={16} /></Link>
         </div>
         <div className="hero-plant">🌿</div>
       </section>
 
       <div className="metrics">
-        {metrics.map(([label,value,sub,icon]) =>
-          <Metric key={label} label={label} value={value} sub={sub} icon={icon}/>
-        )}
+        {metrics.map(([label, value, sub, icon]) => (
+          <Metric key={label} label={label} value={value} sub={sub} icon={icon} />
+        ))}
       </div>
 
       <div className="dashboard-grid">
-        <Card title="Plantation Health" icon={<Leaf size={18}/>}>
+        <Card title="Plantation Health" icon={<Leaf size={18} />}>
           <div className="health-panel">
             <div className="health-ring"><span>{data.farm.health_score}%</span></div>
             <div>
@@ -71,7 +75,7 @@ export default function Dashboard() {
 
       <Card title="Latest Updates">
         <div className="feed">
-          {data.news.map(item => (
+          {data.news.map((item) => (
             <div className="feed-row" key={item.id}>
               <Pill>{item.category}</Pill>
               <div><b>{item.title}</b><p>{item.summary}</p></div>

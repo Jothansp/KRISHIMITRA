@@ -1,7 +1,9 @@
-import React from "react";
+import type { ReactNode } from "react";
 import { LoaderCircle } from "lucide-react";
 
-export function PageHeader({eyebrow, title, description, action}) {
+export function PageHeader({ eyebrow, title, description, action }: {
+  eyebrow: string; title: string; description: string; action?: ReactNode;
+}) {
   return (
     <header className="page-header">
       <div>
@@ -14,7 +16,9 @@ export function PageHeader({eyebrow, title, description, action}) {
   );
 }
 
-export function Card({title, icon, children, className=""}) {
+export function Card({ title, icon, children, className = "" }: {
+  title?: string; icon?: ReactNode; children: ReactNode; className?: string;
+}) {
   return (
     <section className={`card ${className}`}>
       {title && (
@@ -29,18 +33,24 @@ export function Card({title, icon, children, className=""}) {
 }
 
 export function Loading() {
-  return <div className="loading"><LoaderCircle className="spin" size={22}/> Loading...</div>;
+  return <div className="loading"><LoaderCircle className="spin" size={22} /> Loading...</div>;
 }
 
-export function Empty({children="No data available."}) {
+export function ErrorNote({ message }: { message: string }) {
+  return message ? <div className="warning-box" role="alert">{message}</div> : null;
+}
+
+export function Empty({ children = "No data available." }: { children?: ReactNode }) {
   return <div className="empty">{children}</div>;
 }
 
-export function Pill({children, tone=""}) {
+export function Pill({ children, tone = "" }: { children: ReactNode; tone?: string }) {
   return <span className={`pill ${tone}`}>{children}</span>;
 }
 
-export function Metric({label, value, sub, icon}) {
+export function Metric({ label, value, sub, icon }: {
+  label: string; value: ReactNode; sub?: string; icon: ReactNode;
+}) {
   return (
     <div className="metric">
       <div className="metric-icon">{icon}</div>
